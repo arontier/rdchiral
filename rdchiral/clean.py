@@ -1,5 +1,4 @@
-from __future__ import print_function
-import rdkit.Chem as Chem 
+import rdkit.Chem as Chem
 import re
 from itertools import chain
 

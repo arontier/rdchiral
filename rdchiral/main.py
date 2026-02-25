@@ -1,5 +1,4 @@
-from __future__ import print_function
-import sys 
+import sys
 import os
 import re
 import copy
@@ -118,12 +117,13 @@ def rdchiralRun(rxn, reactants, keep_mapnums=False, combine_enantiomers=True, re
 
     ###############################################################################
     # Run naive RDKit on ACHIRAL version of molecules
-    outcomes = rxn.rxn.RunReactants((reactants.reactants_achiral,))
+    outcomes = rxn.rxn.RunReactants(reactants.reactants_achiral_list)
     if PLEVEL >= (1): print('Using naive RunReactants, {} outcomes'.format(len(outcomes)))
     if not outcomes:
+        if return_mapped:
+            return [], {}
         return []
     ###############################################################################
-    
 
     ###############################################################################
     # Initialize, now that there is at least one outcome
@@ -151,19 +151,32 @@ def rdchiralRun(rxn, reactants, keep_mapnums=False, combine_enantiomers=True, re
         # reactants (e.g., LGs for a retro reaction)
         if PLEVEL >= (2): print('Processing {}'.format(str([Chem.MolToSmiles(x, True) for x in outcome])))
         unmapped = 900
+        # For multi-fragment reactants, build a lookup that maps
+        # (frag-local react_atom_idx) -> combined-mol global idx
+        # RDKit sets react_atom_idx as the LOCAL atom index within each reactant
+        # mol when RunReactants receives a tuple of separate mols.
+        frag_atom_indices = reactants.reactant_frag_atom_indices  # None if single mol
         for m in outcome:
             for a in m.GetAtoms():
                 # Assign map number to outcome based on react_atom_idx
                 if a.HasProp('react_atom_idx'):
-                    a.SetAtomMapNum(reactants.idx_to_mapnum(int(a.GetProp('react_atom_idx'))))
+                    raw_idx = int(a.GetProp('react_atom_idx'))
+                    if frag_atom_indices is not None:
+                        # Translate fragment-local index to combined-mol global index.
+                        # Iterate through fragments to find which one this local idx
+                        # belongs to, then look up the combined-mol index.
+                        remaining = raw_idx
+                        for frag_indices in frag_atom_indices:
+                            if remaining < len(frag_indices):
+                                raw_idx = frag_indices[remaining]
+                                break
+                            remaining -= len(frag_indices)
+                    a.SetAtomMapNum(reactants.idx_to_mapnum(raw_idx))
                 if not a.GetAtomMapNum():
                     a.SetAtomMapNum(unmapped)
                     unmapped += 1
         if PLEVEL >= 2: print('Added {} map numbers to product'.format(unmapped-900))
-        ###############################################################################
 
-
-        ###############################################################################
         # Check to see if reactants should not have been matched (based on chirality)
 
         # Define map num -> reactant template atom map
@@ -324,14 +337,26 @@ def rdchiralRun(rxn, reactants, keep_mapnums=False, combine_enantiomers=True, re
 
 
         # Now that we've fixed any bonds, connectivity is set. This is a good time
-        # to udpate the property cache, since all that is left is fixing atom/bond
+        # to update the property cache, since all that is left is fixing atom/bond
         # stereochemistry.
+        # Remove residual SMARTS query properties (_QueryHCount etc.) that may have
+        # been copied from template atoms. These can cause incorrect valence errors
+        # during SanitizeMol (e.g. [OH-] getting valence 3 from _QueryHCount=1).
+        outcome = Chem.RWMol(outcome)
+        for a in outcome.GetAtoms():
+            for prop in list(a.GetPropsAsDict().keys()):
+                if prop.startswith('_Query'):
+                    a.ClearProp(prop)
+        outcome = outcome.GetMol()
         try:
             Chem.SanitizeMol(outcome)
             outcome.UpdatePropertyCache()
-        except ValueError as e: 
+        except ValueError as e:
             if PLEVEL >= 1: print('{}, {}'.format(Chem.MolToSmiles(outcome, True), e))
             continue
+        # Refresh atoms_p after the RWMol->GetMol conversion above, since the
+        # previous atom references were invalidated by the mol rebuild.
+        atoms_p = {a.GetAtomMapNum(): a for a in outcome.GetAtoms() if a.GetAtomMapNum()}
 
 
         ###############################################################################

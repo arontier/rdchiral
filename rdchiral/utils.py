@@ -1,4 +1,3 @@
-from __future__ import print_function
 
 PLEVEL = 0
 def vprint(level, txt, *args):

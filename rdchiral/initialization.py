@@ -7,8 +7,8 @@ from rdchiral.utils import vprint, PLEVEL
 from rdchiral.bonds import enumerate_possible_cistrans_defs, bond_dirs_by_mapnum, \
     get_atoms_across_double_bonds
 
-BondDirOpposite = {AllChem.BondDir.ENDUPRIGHT: AllChem.BondDir.ENDDOWNRIGHT,
-                   AllChem.BondDir.ENDDOWNRIGHT: AllChem.BondDir.ENDUPRIGHT}
+BondDirOpposite = {BondDir.ENDUPRIGHT: BondDir.ENDDOWNRIGHT,
+                   BondDir.ENDDOWNRIGHT: BondDir.ENDUPRIGHT}
 
 class rdchiralReaction(object):
     '''Class to store everything that should be pre-computed for a reaction. This
@@ -77,14 +77,20 @@ class rdchiralReaction(object):
 
 class rdchiralReactants(object):
     '''Class to store everything that should be pre-computed for a reactant mol
-    so that library application is faster
+    so that library application is faster.
+
+    Supports both single-molecule and multi-molecule (dot-separated) SMILES.
+    When the SMILES contains multiple fragments (e.g., "CCBr.[OH-]"), the
+    reactants are stored as a combined molecule for atom-level operations,
+    and also as a tuple of individual molecules for RunReactants.
 
     Attributes:
         reactant_smiles (str): Reactant SMILES string
-        reactants (rdkit.Chem.rdchem.Mol): RDKit Molecule create from `initialize_reactants_from_smiles`
+        reactants (rdkit.Chem.rdchem.Mol): RDKit Molecule (combined)
         atoms_r (dict): Dictionary mapping from atom map number to atom in `reactants` Molecule
         idx_to_mapnum (callable): callable function that takes idx and returns atom map number
-        reactants_achiral (rdkit.Chem.rdchem.Mol): achiral version of `reactants`
+        reactants_achiral (rdkit.Chem.rdchem.Mol): achiral version of `reactants` (combined)
+        reactants_achiral_list (tuple): tuple of individual achiral mols for RunReactants
         bonds_by_mapnum (list): List of reactant bonds
             (int, int, rdkit.Chem.rdchem.Bond)
         bond_dirs_by_mapnum (dict): Dictionary mapping from atom map number tuples to BondDir
@@ -92,13 +98,14 @@ class rdchiralReactants(object):
 
     Args:
         reactant_smiles (str): Reactant SMILES string
+        custom_reactant_mapping (bool): Whether custom atom mapping is provided
     '''
     def __init__(self, reactant_smiles, custom_reactant_mapping=False):
         # Keep original smiles, useful for reporting
         self.reactant_smiles = reactant_smiles
         self.custom_mapping = custom_reactant_mapping
 
-        # Initialize into RDKit mol
+        # Initialize into RDKit mol (combined)
         self.reactants = initialize_reactants_from_smiles(reactant_smiles, custom_reactant_mapping)
 
         # Set mapnum->atom dictionary
@@ -106,16 +113,45 @@ class rdchiralReactants(object):
         self.atoms_r = {a.GetAtomMapNum(): a for a in self.reactants.GetAtoms()}
         self.idx_to_mapnum = lambda idx: self.reactants.GetAtomWithIdx(idx).GetAtomMapNum()
 
-        # Create copy of molecule without chiral information, used with
-        # RDKit's naive runReactants
+        # Create combined achiral copy (used for atom-level operations)
         self.reactants_achiral = initialize_reactants_from_smiles(reactant_smiles, custom_reactant_mapping)
         [a.SetChiralTag(ChiralType.CHI_UNSPECIFIED) for a in self.reactants_achiral.GetAtoms()]
-        [(b.SetStereo(BondStereo.STEREONONE), b.SetBondDir(BondDir.NONE)) \
+        [(b.SetStereo(BondStereo.STEREONONE), b.SetBondDir(BondDir.NONE))
             for b in self.reactants_achiral.GetBonds()]
+
+        # Build per-fragment achiral mol list for multi-reactant RunReactants calls.
+        # Use Chem.GetMolFrags to correctly split the combined achiral mol into
+        # individual fragment Mols (handles charged species, brackets, etc. safely).
+        #
+        # Important: RDKit sets react_atom_idx = local atom index within each
+        # individual reactant mol (NOT global index across all reactants).
+        # So we need a mapping from (frag_position, local_idx) -> combined_mol_idx
+        # to correctly look up atom map numbers via idx_to_mapnum.
+        frag_atom_indices = Chem.GetMolFrags(self.reactants_achiral)  # tuple of tuples of combined-mol atom idx
+        frags = Chem.GetMolFrags(self.reactants_achiral, asMols=True)
+        if len(frags) > 1:
+            self.reactants_achiral_list = tuple(frags)
+            # For each fragment i, build a list where local_idx -> combined_mol_idx
+            # frag_atom_indices[i][local_idx] = combined_mol_idx
+            self._frag_local_to_global = frag_atom_indices  # tuple of tuples
+            # Build a merged lookup: react_atom_idx (local per-frag) -> combined idx
+            # When RunReactants((f0, f1, ...), react_atom_idx IS the local_idx within fn.
+            # We need (frag_n, local_local_idx) -> combined_idx, but we don't know
+            # which frag an outcome atom came from in react_atom_idx alone.
+            # Instead build a single list: for frag i, local_idx j -> combined idx frag_atom_indices[i][j]
+            # Store as a function that handles the lookup when we know the frag index.
+            # However, since react_atom_idx is only local idx and we don't always know
+            # which frag it belongs to, we build a combined react_atom_idx space by
+            # using old_mapno to find the correct atom.
+            self.reactant_frag_atom_indices = frag_atom_indices
+        else:
+            self.reactants_achiral_list = (self.reactants_achiral,)
+            self.reactant_frag_atom_indices = None
+
 
         # Pre-list reactant bonds (for stitching broken products)
         self.bonds_by_mapnum = [
-            (b.GetBeginAtom().GetAtomMapNum(), b.GetEndAtom().GetAtomMapNum(), b) \
+            (b.GetBeginAtom().GetAtomMapNum(), b.GetEndAtom().GetAtomMapNum(), b)
             for b in self.reactants.GetBonds()
         ]
 

@@ -32,7 +32,7 @@ def bond_dirs_by_mapnum(mol):
     return bond_dirs_by_mapnum
 
 def enumerate_possible_cistrans_defs(template_r, labeling_func=lambda a: a.GetAtomMapNum()):
-    '''This function is meant to take a reactant template and fully enumerate
+    r'''This function is meant to take a reactant template and fully enumerate
     all the ways in which different double-bonds can have their cis/trans
     chirality specified (based on labeling_func). This is necessary because
     double-bond chirality cannot be specified using cis/trans (global properties)
@@ -69,9 +69,9 @@ def enumerate_possible_cistrans_defs(template_r, labeling_func=lambda a: a.GetAt
 
     Args:
         template_r: reactant template
-        labeling_func (callable): Callable function to label an atom. 
+        labeling_func (callable): Callable function to label an atom.
             Function should take an atom and return an int.
-    
+
     Returns:
         (dict, set): Returns required_bond_defs and required_bond_defs_coreatoms
     '''
@@ -343,7 +343,7 @@ def get_atoms_across_double_bonds(mol, labeling_func=lambda a: a.GetAtomMapNum()
     return atoms_across_double_bonds
 
 def restore_bond_stereo_to_sp2_atom(a, bond_dirs_by_mapnum):
-    '''Copy over single-bond directions (ENDUPRIGHT, ENDDOWNRIGHT) to 
+    r'''Copy over single-bond directions (ENDUPRIGHT, ENDDOWNRIGHT) to
     the single bonds attached to some double-bonded atom, a
 
     In some cases, like C=C/O>>C=C/Br, we should assume that stereochem was
@@ -359,7 +359,7 @@ def restore_bond_stereo_to_sp2_atom(a, bond_dirs_by_mapnum):
             molecule did not have a specified chirality at this double bond, then
             the mapnum tuples will be missing from the dict
     Returns:
-        bool: Returns Trueif a bond direction was copied
+        bool: Returns True if a bond direction was copied
     '''
 
     for bond_to_spec in a.GetBonds():

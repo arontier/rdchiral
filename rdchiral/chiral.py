@@ -1,4 +1,3 @@
-from __future__ import print_function
 from rdkit.Chem.rdchem import ChiralType, BondType, BondDir
 
 from rdchiral.utils import vprint, parity4, PLEVEL

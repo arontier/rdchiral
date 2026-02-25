@@ -807,7 +807,7 @@ def extract_from_reaction(reaction):
         print('Could not validate reaction successfully')
         print('ID: {}'.format(reaction['_id']))
         print('retro_canonical: {}'.format(retro_canonical))
-        if VERBOSE: raw_input('Pausing...')
+        if VERBOSE: input('Pausing...')
         return {'reaction_id': reaction['_id']}
 
     template = {
