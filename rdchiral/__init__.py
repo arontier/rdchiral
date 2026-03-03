@@ -7,3 +7,10 @@ if rdkit.__version__ < '2019':
 from rdkit import RDLogger
 lg = RDLogger.logger()
 lg.setLevel(RDLogger.CRITICAL) 
+from rdchiral.template_extractor import (
+    extract_from_reaction,
+    extract_from_reaction_smiles,
+    canonicalize_smarts,
+    canonicalize_smarts_atom,
+    reassign_atom_mapping
+)

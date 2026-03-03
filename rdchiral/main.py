@@ -75,7 +75,7 @@ template.
 
 '''
 
-def rdchiralRunText(reaction_smarts, reactant_smiles, custom_reactant_mapping=False, **kwargs):
+def rdchiralRunText(reaction_smarts, reactant_smiles, custom_reactant_mapping=False, relax_chiral_match=False, verbose=False, **kwargs):
     '''Run from SMARTS string and SMILES string. This is NOT recommended
     for library application, since initialization is pretty slow. You should
     separately initialize the template and molecules and call run()
@@ -83,6 +83,9 @@ def rdchiralRunText(reaction_smarts, reactant_smiles, custom_reactant_mapping=Fa
     Args:
         reaction_smarts (str): Reaction SMARTS string
         reactant_smiles (str): Reactant SMILES string
+        custom_reactant_mapping (bool): Allow custom atom mapping on reactant
+        relax_chiral_match (bool): Allow chirality mismatch
+        verbose (bool): Print debug information
         **kwargs: passed through to `rdchiralRun`
 
     Returns:
@@ -90,9 +93,39 @@ def rdchiralRunText(reaction_smarts, reactant_smiles, custom_reactant_mapping=Fa
     '''
     rxn = rdchiralReaction(reaction_smarts)
     reactants = rdchiralReactants(reactant_smiles, custom_reactant_mapping)
-    return rdchiralRun(rxn, reactants, **kwargs)
+    return rdchiralRun(rxn, reactants, relax_chiral_match=relax_chiral_match, verbose=verbose, **kwargs)
 
-def rdchiralRun(rxn, reactants, keep_mapnums=False, combine_enantiomers=True, return_mapped=False):
+def rdchiralHasMatch(rxn, reactants):
+    '''Quickly check if the given reactants possibly match the reaction template 
+    without generating the outcomes.
+    
+    Args:
+        rxn (rdchiralReaction): (rdkit reaction + auxilliary information)
+        reactants (rdchiralReactants): (rdkit mol + auxilliary information)
+        
+    Returns:
+        bool: True if there is a substructure match, False otherwise
+    '''
+    num_templates = rxn.rxn.GetNumReactantTemplates()
+    reactants_list = reactants.reactants_achiral_list
+
+    if len(reactants_list) == 1 and num_templates > 1 and getattr(rxn, 'rxn_intra', None):
+        rxn_to_check = rxn.rxn_intra
+    else:
+        rxn_to_check = rxn.rxn
+        
+    mtries = rxn_to_check.GetReactants()
+    
+    # RDKit's RunReactants requires a strict 1-to-1 ordered match between templates and reactants.
+    # We only check if the current order of reactant fragments satisfies all templates in order.
+    # Note: len(reactants_list) can be greater than num_templates if there are spectator fragments
+    if len(reactants_list) >= num_templates:
+        if all(r_frag.HasSubstructMatch(t_frag) for r_frag, t_frag in zip(reactants_list[:num_templates], mtries)):
+            return True
+                
+    return False
+
+def rdchiralRun(rxn, reactants, keep_mapnums=False, combine_enantiomers=True, return_mapped=False, relax_chiral_match=False, verbose=False):
     '''Run rdchiral reaction
 
     NOTE: there is a fair amount of initialization (assigning stereochem), most
@@ -117,8 +150,38 @@ def rdchiralRun(rxn, reactants, keep_mapnums=False, combine_enantiomers=True, re
 
     ###############################################################################
     # Run naive RDKit on ACHIRAL version of molecules
-    outcomes = rxn.rxn.RunReactants(reactants.reactants_achiral_list)
-    if PLEVEL >= (1): print('Using naive RunReactants, {} outcomes'.format(len(outcomes)))
+    outcomes = []
+    
+    num_templates = rxn.rxn.GetNumReactantTemplates()
+    reactants_list = reactants.reactants_achiral_list
+    
+    # NEW: Try to match multiple reactant templates to a single molecule
+    # if it's an intra reaction formatted as A.B >> C
+    if len(reactants_list) == 1 and num_templates > 1 and getattr(rxn, 'rxn_intra', None):
+        try:
+            for outcome in rxn.rxn_intra.RunReactants(reactants_list):
+                # For rxn_intra, all matched atoms belong to the single reactant fragment
+                outcomes.append((outcome, (reactants_list[0],)*num_templates))
+        except Exception as e:
+            pass
+    #if len(reactants_list) >= num_templates:
+    #    for r_tuple in itertools.permutations(reactants_list, num_templates):
+    #        print(r_tuple)
+    #        try:
+    #            for outcome in rxn.rxn.RunReactants(r_tuple):
+    #                outcomes.append((outcome, r_tuple))
+    #                print(Chem.MolToSmiles(outcome[0],True), num_templates, r_tuple)
+    #        except Exception as e:
+    #            print(e)
+    #            pass
+    #else:
+    try:
+        for outcome in rxn.rxn.RunReactants(reactants_list):
+            outcomes.append((outcome, reactants_list))
+    except Exception as e:
+        pass
+
+    if PLEVEL >= (1) or verbose: print('Using naive RunReactants, {} outcomes'.format(len(outcomes)))
     if not outcomes:
         if return_mapped:
             return [], {}
@@ -144,34 +207,25 @@ def rdchiralRun(rxn, reactants, keep_mapnums=False, combine_enantiomers=True, re
     ###############################################################################
 
 
-    for outcome in outcomes:
+    for outcome, r_tuple in outcomes:
 
         ###############################################################################
         # Look for new atoms in products that were not in 
         # reactants (e.g., LGs for a retro reaction)
         if PLEVEL >= (2): print('Processing {}'.format(str([Chem.MolToSmiles(x, True) for x in outcome])))
         unmapped = 900
-        # For multi-fragment reactants, build a lookup that maps
-        # (frag-local react_atom_idx) -> combined-mol global idx
-        # RDKit sets react_atom_idx as the LOCAL atom index within each reactant
-        # mol when RunReactants receives a tuple of separate mols.
-        frag_atom_indices = reactants.reactant_frag_atom_indices  # None if single mol
         for m in outcome:
             for a in m.GetAtoms():
-                # Assign map number to outcome based on react_atom_idx
+                # Assign map number to outcome based on react_atom_idx and r_tuple
                 if a.HasProp('react_atom_idx'):
                     raw_idx = int(a.GetProp('react_atom_idx'))
-                    if frag_atom_indices is not None:
-                        # Translate fragment-local index to combined-mol global index.
-                        # Iterate through fragments to find which one this local idx
-                        # belongs to, then look up the combined-mol index.
-                        remaining = raw_idx
-                        for frag_indices in frag_atom_indices:
-                            if remaining < len(frag_indices):
-                                raw_idx = frag_indices[remaining]
-                                break
-                            remaining -= len(frag_indices)
-                    a.SetAtomMapNum(reactants.idx_to_mapnum(raw_idx))
+                    if a.HasProp('old_mapno'):
+                        # Atom matching the template
+                        old_mapno = int(a.GetProp('old_mapno'))
+                        frag_idx = rxn.template_atom_mapnum_to_frag_idx.get(old_mapno)
+                        if frag_idx is not None and frag_idx < len(r_tuple):
+                            orig_atom = r_tuple[frag_idx].GetAtomWithIdx(raw_idx)
+                            a.SetAtomMapNum(orig_atom.GetAtomMapNum())
                 if not a.GetAtomMapNum():
                     a.SetAtomMapNum(unmapped)
                     unmapped += 1
@@ -195,21 +249,27 @@ def rdchiralRun(rxn, reactants, keep_mapnums=False, combine_enantiomers=True, re
         prev = None
         skip_outcome = False
         for match in (atom_chirality_matches(atoms_rt[i], atoms_r[i]) for i in atoms_rt):
-            if match == 0: 
-                if PLEVEL >= 2: print('Chirality violated! Should not have gotten this match')
-                skip_outcome = True 
-                break
+            if match == 0:
+                if relax_chiral_match:
+                    if PLEVEL >= 2 or verbose: print('Chirality violated! But relax_chiral_match=True, so allowing mismatch')
+                else:                     
+                    if PLEVEL >= 2 or verbose: print('Chirality violated! Should not have gotten this match')
+                    skip_outcome = True 
+                    break
             elif match == 2: # ambiguous case
                 continue
             elif prev is None:
                 prev = match
             elif match != prev:
-                if PLEVEL >= 2: print('Part of the template matched reactant chirality, part is inverted! Should not match')
-                skip_outcome = True 
-                break
+                if relax_chiral_match:
+                    if PLEVEL >= 2 or verbose: print('Part of the template matched reactant chirality, part is inverted! But relax_chiral_match=True')
+                else:
+                    if PLEVEL >= 2 or verbose: print('Part of the template matched reactant chirality, part is inverted! Should not match')
+                    skip_outcome = True 
+                    break
         if skip_outcome:
             continue      
-        if PLEVEL >= 2: print('Chirality matches! Just checked with atom_chirality_matches')
+        if PLEVEL >= 2 or verbose: print('Chirality matches! Just checked with atom_chirality_matches')
 
         # Check bond chirality - iterate through reactant double bonds where
         # chirality is specified (or not). atoms defined by map number
@@ -352,7 +412,7 @@ def rdchiralRun(rxn, reactants, keep_mapnums=False, combine_enantiomers=True, re
             Chem.SanitizeMol(outcome)
             outcome.UpdatePropertyCache()
         except ValueError as e:
-            if PLEVEL >= 1: print('{}, {}'.format(Chem.MolToSmiles(outcome, True), e))
+            if PLEVEL >= 1 or verbose: print('Sanitize Exception! {}, {}'.format(Chem.MolToSmiles(outcome, True), e))
             continue
         # Refresh atoms_p after the RWMol->GetMol conversion above, since the
         # previous atom references were invalidated by the mol rebuild.
@@ -541,6 +601,7 @@ def rdchiralRun(rxn, reactants, keep_mapnums=False, combine_enantiomers=True, re
         smiles = Chem.MolToSmiles(outcome, True)
         smiles_new = canonicalize_outcome_smiles(smiles)
         if smiles_new is None:
+            if verbose: print('canonicalize_outcome_smiles returned None for', smiles)
             continue
 
         final_outcomes.add(smiles_new)

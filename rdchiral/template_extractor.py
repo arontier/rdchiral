@@ -427,6 +427,109 @@ def reassign_atom_mapping(transform):
 
     return transform_newmaps
 
+
+def canonicalize_smarts(smarts):
+    '''Canonicalize a single SMARTS string using RDKit.
+    
+    Args:
+        smarts (str): A SMARTS pattern string (may or may not have atom maps).
+
+    Returns:
+        str: Canonical SMARTS string, or original string if parsing fails.
+    '''
+    mol = Chem.MolFromSmarts(smarts)
+    if mol is None:
+        return smarts
+    return Chem.MolToSmarts(mol)
+
+
+def canonicalize_smarts_atom(transform, output_degree=True,
+                              invert_all_chiral_centers=False,
+                              output_hydrogen=True):
+    '''Re-order atom SMARTS primitives within brackets into a canonical form.
+
+    Normalizes the order of primitives inside each [] atom block:
+    [isotope][symbol][@][H][charge][;D<degree>][:<mapnum>]
+
+    Args:
+        transform (str): A SMARTS or reaction SMARTS string.
+        output_degree (bool): Include degree (D) primitive in output.
+        invert_all_chiral_centers (bool): Swap @ and @@ on all atoms.
+        output_hydrogen (bool): Include H-count primitive in output.
+
+    Returns:
+        str: SMARTS string with re-ordered atom primitives.
+    '''
+    import re as _re
+    # Match content inside [...]
+    atom_label_pat = _re.compile(r'\[([^\]]+)\]')
+    # Match optional ":<mapnum>" at end of atom content
+    mapno_pat = _re.compile(r'^(.*?)(:[0-9]+)$')
+    # Match atom type at start: [isotope][symbol/wildcard][@*][H-count][charge]
+    atom_type_pat = _re.compile(
+        r'^([0-9]*)'
+        r'([A-Za-z]+|#[0-9]+|\*)'
+        r'(@*)'
+        r'(H[0-9]*)?' 
+        r'([+\-][0-9]*|\++|\-+)?'
+    )
+
+    def _reorder_atom(m):
+        content = m.group(1)
+        mapno = ''
+        mm = mapno_pat.match(content)
+        if mm:
+            mapno = mm.group(2)
+            content = mm.group(1)
+
+        parts = _re.split(r'[;&]', content)
+        tm = atom_type_pat.match(parts[0])
+        if not tm:
+            return m.group(0)  # cannot parse, leave as-is
+
+        isotope  = tm.group(1) or ''
+        symbol   = tm.group(2) or ''
+        atsign   = tm.group(3) or ''
+        h_count  = tm.group(4) or ''
+        charges  = tm.group(5) or ''
+
+        degree = ''
+        for cond in parts[1:]:
+            if cond.startswith('D'):   degree   = cond
+            elif cond.startswith('H'):  h_count  = cond
+            elif cond.startswith('@'):  atsign   = cond
+            elif cond and cond[0] in '+-': charges = cond
+
+        # Normalise H
+        if h_count and len(h_count) > 1 and h_count[1:].isdigit() and int(h_count[1:]) == 0:
+            h_count = 'H0'
+        elif h_count == 'H':
+            h_count = 'H1'
+
+        # Normalise charges: "++" -> "+2" etc.
+        if charges:
+            if len(charges) == 1:
+                charges += '1'
+            elif charges[0] == charges[-1] and len(set(charges)) == 1:
+                charges = charges[0] + str(len(charges))
+            if charges in ('+0', '-0'):
+                charges = '+0'
+
+        # Invert chirality if requested
+        if invert_all_chiral_centers:
+            if atsign == '@':   atsign = '@@'
+            elif atsign == '@@': atsign = '@'
+
+        new_content = isotope + symbol + atsign
+        if output_hydrogen: new_content += h_count
+        new_content += charges
+        if output_degree and degree:
+            new_content += ';' + degree
+        new_content += mapno
+        return '[' + new_content + ']'
+
+    return atom_label_pat.sub(_reorder_atom, transform)
+
 def get_strict_smarts_for_atom(atom):
     '''
     For an RDkit atom object, generate a SMARTS pattern that
@@ -494,8 +597,8 @@ def expand_changed_atom_tags(changed_atom_tags, reactant_fragments):
     if VERBOSE: print('after building reactant fragments, additional labels included: {}'.format(expansion))
     return expansion
 
-def get_fragments_for_changed_atoms(mols, changed_atom_tags, radius=0, 
-    category='reactants', expansion=[]):
+def get_fragments_for_changed_atoms(mols, changed_atom_tags, radius=0,
+    category='reactants', expansion=[], no_special_groups=False):
     '''Given a list of RDKit mols and a list of changed atom tags, this function
     computes the SMILES string of molecular fragments using MolFragmentToSmiles 
     for all changed fragments.
@@ -510,7 +613,7 @@ def get_fragments_for_changed_atoms(mols, changed_atom_tags, radius=0,
         symbol_replacements = []
 
         # Are we looking for special reactive groups? (reactants only)
-        if category == 'reactants':
+        if category == 'reactants' and not no_special_groups:
             groups = get_special_groups(mol)
         else:
             groups = []
@@ -647,7 +750,9 @@ def canonicalize_transform(transform):
     atom maps.'''
 
     transform_reordered = '>>'.join([canonicalize_template(x) for x in transform.split('>>')])
-    return reassign_atom_mapping(transform_reordered)
+    transform_reassigned = reassign_atom_mapping(transform_reordered)
+    # Apply canonicalization to atom primitives (H, charge, degree, etc.)
+    return canonicalize_smarts_atom(transform_reassigned)
 
 def canonicalize_template(template):
     '''This function takes one-half of a template SMARTS string 
@@ -671,7 +776,10 @@ def canonicalize_template(template):
 
         # Apply sorting and merge list back into overall mol fragment
         template_nolabels_mols[i] = '.'.join([nolabel_mol_frags[j] for j in sortorder])
-        template_mols[i]          = '.'.join([mol_frags[j] for j in sortorder])
+        
+        # Apply canonicalize_smarts to each fragment before joining
+        canonicalized_frags = [canonicalize_smarts(mol_frags[j]) for j in sortorder]
+        template_mols[i]          = '.'.join(canonicalized_frags)
 
     # Get sort order between molecules, defined WITHOUT labels
     sortorder = [j[0] for j in sorted(enumerate(template_nolabels_mols), key = lambda x:x[1])]
@@ -694,7 +802,27 @@ def bond_to_label(bond):
 
     return '{}{}{}'.format(atoms[0], bond.GetSmarts(), atoms[1])
 
-def extract_from_reaction(reaction):
+def extract_from_reaction(reaction, radius=1, no_special_groups=False):
+    '''Extract a reaction template from an atom-mapped reaction.
+
+    Args:
+        reaction (dict): Must contain ``'reactants'`` and ``'products'`` keys
+            with dot-separated, atom-mapped SMILES strings.  An optional
+            ``'_id'`` key is used for error reporting.
+        radius (int): Number of atoms around the reaction centre to include
+            in the template.  Default 1 (one-shell).
+        no_special_groups (bool): When True, special functional-group
+            heuristics are skipped during reactant template expansion.
+            Default False.
+
+    Returns:
+        dict or None: Template dictionary with keys:
+            ``reactants``, ``products``,
+            ``reaction_smarts`` (retro, for backward compat),
+            ``reaction_smarts_forward``, ``reaction_smarts_retro``,
+            ``intra_only``, ``dimer_only``, ``necessary_reagent``.
+            Returns a dict with only ``reaction_id`` on failure.
+    '''
     reactants = mols_from_smiles_list(replace_deuterated(reaction['reactants']).split('.'))
     products = mols_from_smiles_list(replace_deuterated(reaction['products']).split('.'))
     
@@ -775,23 +903,25 @@ def extract_from_reaction(reaction):
 
     try:
         # Get fragments for reactants
-        reactant_fragments, intra_only, dimer_only = get_fragments_for_changed_atoms(reactants, changed_atom_tags, 
-            radius = 1, expansion = [], category = 'reactants')
-        # Get fragments for products 
+        reactant_fragments, intra_only, dimer_only = get_fragments_for_changed_atoms(
+            reactants, changed_atom_tags,
+            radius=radius, expansion=[], category='reactants',
+            no_special_groups=no_special_groups)
+        # Get fragments for products
         # (WITHOUT matching groups but WITH the addition of reactant fragments)
-        product_fragments, _, _  = get_fragments_for_changed_atoms(products, changed_atom_tags, 
-            radius = 0, expansion = expand_changed_atom_tags(changed_atom_tags, reactant_fragments),
-            category = 'products')
+        product_fragments, _, _ = get_fragments_for_changed_atoms(
+            products, changed_atom_tags,
+            radius=0, expansion=expand_changed_atom_tags(changed_atom_tags, reactant_fragments),
+            category='products', no_special_groups=no_special_groups)
     except ValueError as e:
         if VERBOSE:
             print(e)
             print(reaction['_id'])
         return {'reaction_id': reaction['_id']}
 
-    # Put together and canonicalize (as best as possible)
     rxn_string = '{}>>{}'.format(reactant_fragments, product_fragments)
     rxn_canonical = canonicalize_transform(rxn_string)
-    # Change from inter-molecular to intra-molecular 
+    # Change from inter-molecular to intra-molecular
     rxn_canonical_split = rxn_canonical.split('>>')
     rxn_canonical = rxn_canonical_split[0][1:-1].replace(').(', '.') + \
         '>>' + rxn_canonical_split[1][1:-1].replace(').(', '.')
@@ -799,11 +929,12 @@ def extract_from_reaction(reaction):
     reactants_string = rxn_canonical.split('>>')[0]
     products_string  = rxn_canonical.split('>>')[1]
 
-    retro_canonical = products_string + '>>' + reactants_string
+    forward_canonical = rxn_canonical          # reactants >> products
+    retro_canonical   = products_string + '>>' + reactants_string
 
-    # Load into RDKit
+    # Load into RDKit to validate
     rxn = AllChem.ReactionFromSmarts(retro_canonical)
-    if rxn.Validate()[1] != 0: 
+    if rxn.Validate()[1] != 0:
         print('Could not validate reaction successfully')
         print('ID: {}'.format(reaction['_id']))
         print('retro_canonical: {}'.format(retro_canonical))
@@ -813,11 +944,53 @@ def extract_from_reaction(reaction):
     template = {
         'products': products_string,
         'reactants': reactants_string,
-        'reaction_smarts': retro_canonical,
+        'reaction_smarts': retro_canonical,          # backward compat
+        'reaction_smarts_forward': forward_canonical, # NEW
+        'reaction_smarts_retro': retro_canonical,     # NEW (explicit)
         'intra_only': intra_only,
         'dimer_only': dimer_only,
-        'reaction_id': reaction['_id'],
+        'reaction_id': reaction.get('_id', ''),
         'necessary_reagent': extra_reactant_fragment,
     }
-    
+
     return template
+
+def extract_from_reaction_smiles(reactants_smiles, products_smiles,
+    verbose=False, use_stereochemistry=True,
+    maximum_number_unmapped_product_atoms=5,
+    include_all_unmapped_reactant_atoms=True,
+    radius=1, no_special_groups=False):
+    '''Extract a reaction template given reactant and product SMILES directly.
+    Similar to extract_from_reaction, but avoids creating a dictionary wrapper
+    and uses global overrides for keyword parameter execution.
+    '''
+    global VERBOSE, USE_STEREOCHEMISTRY, MAXIMUM_NUMBER_UNMAPPED_PRODUCT_ATOMS, INCLUDE_ALL_UNMAPPED_REACTANT_ATOMS
+    old_verbose = VERBOSE
+    old_use = USE_STEREOCHEMISTRY
+    old_max = MAXIMUM_NUMBER_UNMAPPED_PRODUCT_ATOMS
+    old_incl = INCLUDE_ALL_UNMAPPED_REACTANT_ATOMS
+    
+    VERBOSE = verbose
+    USE_STEREOCHEMISTRY = use_stereochemistry
+    MAXIMUM_NUMBER_UNMAPPED_PRODUCT_ATOMS = maximum_number_unmapped_product_atoms
+    INCLUDE_ALL_UNMAPPED_REACTANT_ATOMS = include_all_unmapped_reactant_atoms
+    
+    try:
+        reaction = {
+            'reactants': reactants_smiles,
+            'products': products_smiles,
+            '_id': 'extract_from_reaction_smiles'
+        }
+        res = extract_from_reaction(reaction, radius=radius, no_special_groups=no_special_groups)
+        
+        # remove internal rxn id and just return dictionary
+        if res and 'reaction_id' in res:
+            if list(res.keys()) == ['reaction_id']:
+                return None
+            del res['reaction_id']
+        return res
+    finally:
+        VERBOSE = old_verbose
+        USE_STEREOCHEMISTRY = old_use
+        MAXIMUM_NUMBER_UNMAPPED_PRODUCT_ATOMS = old_max
+        INCLUDE_ALL_UNMAPPED_REACTANT_ATOMS = old_incl

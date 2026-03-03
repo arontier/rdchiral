@@ -36,6 +36,17 @@ class rdchiralReaction(object):
         # Initialize - assigns stereochemistry and fills in missing rct map numbers
         self.rxn = initialize_rxn_from_smarts(reaction_smarts)
 
+        # Create intramolecular version if applicable
+        self.rxn_intra = None
+        if '>>' in reaction_smarts:
+            rsmarts, psmarts = reaction_smarts.split('>>')
+            if '.' in rsmarts:
+                intra_smarts = f"({rsmarts})>>{psmarts}"
+                try:
+                    self.rxn_intra = initialize_rxn_from_smarts(intra_smarts)
+                except Exception:
+                    pass
+
         # Combine template fragments so we can play around with mapnums
         self.template_r, self.template_p = get_template_frags_from_rxn(self.rxn)
 
@@ -44,6 +55,12 @@ class rdchiralReaction(object):
             for a in self.template_r.GetAtoms() if a.GetAtomMapNum()}
         self.atoms_pt_map = {a.GetAtomMapNum(): a \
             for a in self.template_p.GetAtoms() if a.GetAtomMapNum()}
+
+        self.template_atom_mapnum_to_frag_idx = {}
+        for i, rct in enumerate(self.rxn.GetReactants()):
+            for a in rct.GetAtoms():
+                if a.GetAtomMapNum():
+                    self.template_atom_mapnum_to_frag_idx[a.GetAtomMapNum()] = i
 
         # Back-up the mapping for the reaction
         self.atoms_rt_idx_to_map = {a.GetIdx(): a.GetAtomMapNum()
