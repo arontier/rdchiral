@@ -612,9 +612,9 @@ def rdchiralRun(rxn, reactants, keep_mapnums=False, combine_enantiomers=True, re
         final_outcomes = combine_enantiomers_into_racemic(final_outcomes)
     ###############################################################################
     if return_mapped:
-        return list(final_outcomes), mapped_outcomes
+        return sorted(list(final_outcomes)), mapped_outcomes
     else:
-        return list(final_outcomes)
+        return sorted(list(final_outcomes))
 
 if __name__ == '__main__':
     # Directly use SMILES/SMARTS
